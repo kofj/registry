@@ -1,0 +1,115 @@
+package v0
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/danielgtaylor/huma/v2"
+
+	"github.com/modelcontextprotocol/registry/internal/auth"
+	"github.com/modelcontextprotocol/registry/internal/config"
+	"github.com/modelcontextprotocol/registry/internal/database"
+	"github.com/modelcontextprotocol/registry/internal/service"
+	"github.com/modelcontextprotocol/registry/internal/validators"
+	apiv0 "github.com/modelcontextprotocol/registry/pkg/api/v0"
+)
+
+// EditServerInput represents the input for editing a server
+type EditServerInput struct {
+	Authorization string           `header:"Authorization" doc:"Registry JWT token with edit permissions" required:"true"`
+	ServerName    string           `path:"serverName" doc:"URL-encoded server name" example:"com.example%2Fmy-server"`
+	Version       string           `path:"version" doc:"URL-encoded version to edit" example:"1.0.0"`
+	Body          apiv0.ServerJSON `body:""`
+}
+
+// RegisterEditEndpoints registers the edit endpoint with a custom path prefix
+func RegisterEditEndpoints(api huma.API, pathPrefix string, registry service.RegistryService, cfg *config.Config) {
+	jwtManager := auth.NewJWTManager(cfg)
+
+	// Edit server endpoint
+	huma.Register(api, huma.Operation{
+		OperationID: "edit-server" + strings.ReplaceAll(pathPrefix, "/", "-"),
+		Method:      http.MethodPut,
+		Path:        pathPrefix + "/servers/{serverName}/versions/{version}",
+		Summary:     "Edit MCP server",
+		Description: "Update the configuration of a specific version of an existing MCP server. Requires edit permission for the server. Use PATCH /servers/{serverName}/versions/{version}/status to update status metadata.",
+		Tags:        []string{tagServers},
+		Security: []map[string][]string{
+			{securitySchemeBearer: {}},
+		},
+	}, func(ctx context.Context, input *EditServerInput) (*Response[apiv0.ServerResponse], error) {
+		// Extract bearer token
+		const bearerPrefix = "Bearer "
+		authHeader := input.Authorization
+		if len(authHeader) < len(bearerPrefix) || !strings.EqualFold(authHeader[:len(bearerPrefix)], bearerPrefix) {
+			return nil, huma.Error401Unauthorized("Invalid Authorization header format. Expected 'Bearer <token>'")
+		}
+		token := authHeader[len(bearerPrefix):]
+
+		// Validate Registry JWT token
+		claims, err := jwtManager.ValidateToken(ctx, token)
+		if err != nil {
+			return nil, huma.Error401Unauthorized("Invalid or expired Registry JWT token", err)
+		}
+
+		// URL-decode the server name
+		serverName, err := url.PathUnescape(input.ServerName)
+		if err != nil {
+			return nil, huma.Error400BadRequest("Invalid server name encoding", err)
+		}
+
+		// URL-decode the version
+		version, err := url.PathUnescape(input.Version)
+		if err != nil {
+			return nil, huma.Error400BadRequest("Invalid version encoding", err)
+		}
+
+		// Get current server to check permissions against existing name
+		// Deleted servers return 404 - restore via status endpoint first
+		currentServer, err := registry.GetServerByNameAndVersion(ctx, serverName, version, false)
+		if err != nil {
+			if errors.Is(err, database.ErrNotFound) {
+				return nil, huma.Error404NotFound("Server not found")
+			}
+			log.Printf("edit: get current server (%q/%q) failed: %v", serverName, version, err)
+			return nil, huma.Error500InternalServerError("Failed to get current server")
+		}
+
+		// Verify edit permissions for this server using the existing server name
+		if !jwtManager.HasPermission(currentServer.Server.Name, auth.PermissionActionEdit, claims.Permissions) {
+			return nil, huma.Error403Forbidden("You do not have edit permissions for this server")
+		}
+
+		// Prevent renaming servers
+		if currentServer.Server.Name != input.Body.Name {
+			return nil, huma.Error400BadRequest("Cannot rename server")
+		}
+
+		// Validate that the version in the body matches the URL parameter
+		if input.Body.Version != version {
+			return nil, huma.Error400BadRequest("Version in request body must match URL path parameter")
+		}
+
+		// Validate server JSON structure and schema (returns 422 on validation failure)
+		validationResult := validators.ValidateServerJSON(&input.Body, validators.ValidationSchemaVersionAndSemantic)
+		if !validationResult.Valid {
+			return nil, huma.Error422UnprocessableEntity("Failed to edit server, invalid schema: call /validate for details")
+		}
+
+		updatedServer, err := registry.UpdateServer(ctx, serverName, version, &input.Body, nil)
+		if err != nil {
+			if errors.Is(err, database.ErrNotFound) {
+				return nil, huma.Error404NotFound("Server not found")
+			}
+			return nil, huma.Error400BadRequest("Failed to edit server", err)
+		}
+
+		return &Response[apiv0.ServerResponse]{
+			Body: *updatedServer,
+		}, nil
+	})
+}

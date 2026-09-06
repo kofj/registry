@@ -1,134 +1,237 @@
-// Package v0 contains API handlers for version 0 of the API
 package v0
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
+	"log"
 	"net/http"
-	"strconv"
+	"net/url"
+	"reflect"
+	"strings"
+	"time"
 
-	"github.com/google/uuid"
-	"github.com/modelcontextprotocol/registry/internal/model"
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/modelcontextprotocol/registry/internal/database"
 	"github.com/modelcontextprotocol/registry/internal/service"
+	apiv0 "github.com/modelcontextprotocol/registry/pkg/api/v0"
 )
 
-// Response is a paginated API response
-type PaginatedResponse struct {
-	Data     []model.Server `json:"servers"`
-	Metadata Metadata       `json:"metadata,omitempty"`
+const errRecordNotFound = "record not found"
+
+// OptionalBool tracks whether a bool query parameter was explicitly set
+type OptionalBool struct {
+	Value bool
+	IsSet bool
 }
 
-// Metadata contains pagination metadata
-type Metadata struct {
-	NextCursor string `json:"next_cursor,omitempty"`
-	Count      int    `json:"count,omitempty"`
-	Total      int    `json:"total,omitempty"`
+// Schema implements huma.SchemaProvider - returns schema for the wrapped type
+func (o OptionalBool) Schema(r huma.Registry) *huma.Schema {
+	return huma.SchemaFromType(r, reflect.TypeOf(o.Value))
 }
 
-// ServersHandler returns a handler for listing registry items
-func ServersHandler(registry service.RegistryService) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
+// Receiver implements huma.ParamWrapper - exposes wrapped value to receive parsed value
+func (o *OptionalBool) Receiver() reflect.Value {
+	return reflect.ValueOf(o).Elem().Field(0)
+}
+
+// OnParamSet implements huma.ParamReactor - tracks whether parameter was set in request
+func (o *OptionalBool) OnParamSet(isSet bool, _ any) {
+	o.IsSet = isSet
+}
+
+// resolveIncludeDeleted handles the include_deleted parameter logic for list endpoints
+// Returns the resolved value and an error if include_deleted=false conflicts with updated_since
+func resolveIncludeDeleted(includeDeleted OptionalBool, hasUpdatedSince bool) (bool, error) {
+	if hasUpdatedSince {
+		// When updated_since is provided, include_deleted must be true for incremental sync
+		if includeDeleted.IsSet && !includeDeleted.Value {
+			return false, huma.Error400BadRequest("Cannot set include_deleted=false when using updated_since (incremental sync requires deleted servers)")
 		}
+		return true, nil
+	}
+	// Use provided value, defaults to false if not set
+	return includeDeleted.Value, nil
+}
 
-		// Parse cursor and limit from query parameters
-		cursor := r.URL.Query().Get("cursor")
-		if cursor != "" {
-			_, err := uuid.Parse(cursor)
-			if err != nil {
-				http.Error(w, "Invalid cursor parameter", http.StatusBadRequest)
-				return
-			}
-		}
-		limitStr := r.URL.Query().Get("limit")
+// ListServersInput represents the input for listing servers
+type ListServersInput struct {
+	Cursor         string       `query:"cursor" doc:"Pagination cursor" required:"false" example:"server-cursor-123"`
+	Limit          int          `query:"limit" doc:"Number of items per page" default:"30" minimum:"1" maximum:"100" example:"50"`
+	UpdatedSince   string       `query:"updated_since" doc:"Filter servers updated since timestamp (RFC3339 datetime)" required:"false" example:"2025-08-07T13:15:04.280Z"`
+	Search         string       `query:"search" doc:"Search servers by name (substring match)" required:"false" example:"filesystem"`
+	Version        string       `query:"version" doc:"Filter by version ('latest' for latest version, or an exact version like '1.2.3')" required:"false" example:"latest"`
+	IncludeDeleted OptionalBool `query:"include_deleted" doc:"Include deleted servers in results (default: false, but always true when updated_since is provided)" required:"false"`
+}
 
-		// Default limit if not specified
-		limit := 30
+// ServerDetailInput represents the input for getting server details
+type ServerDetailInput struct {
+	ServerName string `path:"serverName" doc:"URL-encoded server name" example:"com.example%2Fmy-server"`
+}
 
-		// Try to parse limit from query param
-		if limitStr != "" {
-			parsedLimit, err := strconv.Atoi(limitStr)
-			if err != nil {
-				http.Error(w, "Invalid limit parameter", http.StatusBadRequest)
-				return
-			}
+// ServerVersionDetailInput represents the input for getting a specific version
+type ServerVersionDetailInput struct {
+	ServerName     string `path:"serverName" doc:"URL-encoded server name" example:"com.example%2Fmy-server"`
+	Version        string `path:"version" doc:"URL-encoded server version" example:"1.0.0"`
+	IncludeDeleted bool   `query:"include_deleted" doc:"Include deleted servers in results (default: false)" required:"false" default:"false"`
+}
 
-			// Check if limit is within reasonable bounds
-			if parsedLimit <= 0 {
-				http.Error(w, "Limit must be greater than 0", http.StatusBadRequest)
-				return
-			}
+// ServerVersionsInput represents the input for listing all versions of a server
+type ServerVersionsInput struct {
+	ServerName     string `path:"serverName" doc:"URL-encoded server name" example:"com.example%2Fmy-server"`
+	IncludeDeleted bool   `query:"include_deleted" doc:"Include deleted servers in results (default: false)" required:"false" default:"false"`
+}
 
-			if parsedLimit > 100 {
-				// Cap maximum limit to prevent excessive queries
-				limit = 100
+// RegisterServersEndpoints registers all server-related endpoints with a custom path prefix
+func RegisterServersEndpoints(api huma.API, pathPrefix string, registry service.RegistryService) {
+	// List servers endpoint
+	huma.Register(api, huma.Operation{
+		OperationID: "list-servers" + strings.ReplaceAll(pathPrefix, "/", "-"),
+		Method:      http.MethodGet,
+		Path:        pathPrefix + "/servers",
+		Summary:     "List MCP servers",
+		Description: "Get a paginated list of MCP servers from the registry",
+		Tags:        []string{tagServers},
+	}, func(ctx context.Context, input *ListServersInput) (*Response[apiv0.ServerListResponse], error) {
+		// Build filter from input parameters
+		filter := &database.ServerFilter{}
+
+		// Parse updated_since parameter
+		if input.UpdatedSince != "" {
+			// Parse RFC3339 format
+			if updatedTime, err := time.Parse(time.RFC3339, input.UpdatedSince); err == nil {
+				filter.UpdatedSince = &updatedTime
 			} else {
-				limit = parsedLimit
+				return nil, huma.Error400BadRequest("Invalid updated_since format: expected RFC3339 timestamp (e.g., 2025-08-07T13:15:04.280Z)")
 			}
 		}
 
-		// Use the GetAll method to get paginated results
-		registries, nextCursor, err := registry.List(cursor, limit)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		// Handle search parameter
+		if input.Search != "" {
+			filter.SubstringName = &input.Search
 		}
 
-		// Create paginated response
-		response := PaginatedResponse{
-			Data: registries,
-		}
-
-		// Add metadata if there's a next cursor
-		if nextCursor != "" {
-			response.Metadata = Metadata{
-				NextCursor: nextCursor,
-				Count:      len(registries),
+		// Handle version parameter
+		if input.Version != "" {
+			if input.Version == "latest" {
+				// Special case: filter for latest versions
+				isLatest := true
+				filter.IsLatest = &isLatest
+			} else {
+				// Future: exact version matching
+				filter.Version = &input.Version
 			}
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(response); err != nil {
-			http.Error(w, "Failed to encode response", http.StatusInternalServerError)
-			return
-		}
-	}
-}
-
-// ServersDetailHandler returns a handler for getting details of a specific server by ID
-func ServersDetailHandler(registry service.RegistryService) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Extract the server ID from the URL path
-		id := r.PathValue("id")
-
-		// Validate that the ID is a valid UUID
-		_, err := uuid.Parse(id)
+		// Handle include_deleted parameter
+		includeDeleted, err := resolveIncludeDeleted(input.IncludeDeleted, filter.UpdatedSince != nil)
 		if err != nil {
-			http.Error(w, "Invalid server ID format", http.StatusBadRequest)
-			return
+			return nil, err
+		}
+		filter.IncludeDeleted = &includeDeleted
+
+		// Get paginated results with filtering
+		servers, nextCursor, err := registry.ListServers(ctx, filter, input.Cursor, input.Limit)
+		if err != nil {
+			return nil, ListServersError(ctx, err)
 		}
 
-		// Get the server details from the registry service
-		serverDetail, err := registry.GetByID(id)
+		// Convert []*ServerResponse to []ServerResponse
+		serverValues := make([]apiv0.ServerResponse, len(servers))
+		for i, server := range servers {
+			serverValues[i] = *server
+		}
+
+		return &Response[apiv0.ServerListResponse]{
+			Body: apiv0.ServerListResponse{
+				Servers: serverValues,
+				Metadata: apiv0.Metadata{
+					NextCursor: nextCursor,
+					Count:      len(servers),
+				},
+			},
+		}, nil
+	})
+
+	// Get specific server version endpoint (supports "latest" as special version)
+	huma.Register(api, huma.Operation{
+		OperationID: "get-server-version" + strings.ReplaceAll(pathPrefix, "/", "-"),
+		Method:      http.MethodGet,
+		Path:        pathPrefix + "/servers/{serverName}/versions/{version}",
+		Summary:     "Get specific MCP server version",
+		Description: "Get detailed information about a specific version of an MCP server. Use the special version 'latest' to get the latest version.",
+		Tags:        []string{tagServers},
+	}, func(ctx context.Context, input *ServerVersionDetailInput) (*Response[apiv0.ServerResponse], error) {
+		// URL-decode the server name
+		serverName, err := url.PathUnescape(input.ServerName)
 		if err != nil {
-			if err.Error() == "record not found" {
-				http.Error(w, "Server not found", http.StatusNotFound)
-				return
+			return nil, huma.Error400BadRequest("Invalid server name encoding", err)
+		}
+
+		// URL-decode the version
+		version, err := url.PathUnescape(input.Version)
+		if err != nil {
+			return nil, huma.Error400BadRequest("Invalid version encoding", err)
+		}
+
+		var serverResponse *apiv0.ServerResponse
+		// Handle "latest" as a special version
+		if version == "latest" {
+			serverResponse, err = registry.GetServerByName(ctx, serverName, input.IncludeDeleted)
+		} else {
+			serverResponse, err = registry.GetServerByNameAndVersion(ctx, serverName, version, input.IncludeDeleted)
+		}
+
+		if err != nil {
+			if err.Error() == errRecordNotFound || errors.Is(err, database.ErrNotFound) {
+				return nil, huma.Error404NotFound("Server not found")
 			}
-			http.Error(w, "Error retrieving server details", http.StatusInternalServerError)
-			return
+			log.Printf("get server details (%q/%q) failed: %v", serverName, version, err)
+			return nil, huma.Error500InternalServerError("Failed to get server details")
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(serverDetail); err != nil {
-			http.Error(w, "Failed to encode response", http.StatusInternalServerError)
-			return
+		return &Response[apiv0.ServerResponse]{
+			Body: *serverResponse,
+		}, nil
+	})
+
+	// Get server versions endpoint
+	huma.Register(api, huma.Operation{
+		OperationID: "get-server-versions" + strings.ReplaceAll(pathPrefix, "/", "-"),
+		Method:      http.MethodGet,
+		Path:        pathPrefix + "/servers/{serverName}/versions",
+		Summary:     "Get all versions of an MCP server",
+		Description: "Get all available versions for a specific MCP server",
+		Tags:        []string{tagServers},
+	}, func(ctx context.Context, input *ServerVersionsInput) (*Response[apiv0.ServerListResponse], error) {
+		// URL-decode the server name
+		serverName, err := url.PathUnescape(input.ServerName)
+		if err != nil {
+			return nil, huma.Error400BadRequest("Invalid server name encoding", err)
 		}
-	}
+
+		// Get all versions for this server
+		servers, err := registry.GetAllVersionsByServerName(ctx, serverName, input.IncludeDeleted)
+		if err != nil {
+			if err.Error() == errRecordNotFound || errors.Is(err, database.ErrNotFound) {
+				return nil, huma.Error404NotFound("Server not found")
+			}
+			log.Printf("get server versions (%q) failed: %v", serverName, err)
+			return nil, huma.Error500InternalServerError("Failed to get server versions")
+		}
+
+		// Convert []*ServerResponse to []ServerResponse
+		serverValues := make([]apiv0.ServerResponse, len(servers))
+		for i, server := range servers {
+			serverValues[i] = *server
+		}
+
+		return &Response[apiv0.ServerListResponse]{
+			Body: apiv0.ServerListResponse{
+				Servers: serverValues,
+				Metadata: apiv0.Metadata{
+					Count: len(servers),
+				},
+			},
+		}, nil
+	})
 }

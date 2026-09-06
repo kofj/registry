@@ -1,23 +1,20 @@
-# Official Registry Documentation
+# MCP Registry Documentation
 
-## Project Documentation
+The MCP registry provides MCP clients with a list of MCP servers, like an app store for MCP servers.
 
-[`design_principles.md`](./design_principles.md) - Core constraints and principles guiding the registry design
+## I want to...
 
-[`faq.md`](./faq.md) - Frequently asked questions about the MCP Registry
+- **📤 Publish my MCP server** → [Publishing Guide](modelcontextprotocol-io/quickstart.mdx)
+- **📥 Consume registry data** → [API Usage Guide](modelcontextprotocol-io/registry-aggregators.mdx)
+- **🔌 Understand the registry's purpose** → [Ecosystem vision](design/ecosystem-vision.md)
+- **📋 Look up specific information** → [server.json spec](reference/server-json/generic-server-json.md) | [API spec](reference/api/generic-registry-api.md) | [CLI reference](reference/cli/commands.md)
+- **🤝 Add reference to my community project** → [Community Projects](community-projects.md)
 
-[`roadmap.md`](./roadmap.md) - High-level roadmap for the MCP Registry development
+## Documentation Index
 
-[`MCP Developers Summit 2025 - Registry Talk Slides.pdf`](./MCP%20Developers%20Summit%202025%20-%20Registry%20Talk%20Slides.pdf) - Slides from a talk given at the MCP Developers Summit on May 23, 2025, with an up-to-date vision of how we are thinking about the official registry.
-
-## API & Technical Specifications
-
-[`openapi.yaml`](./openapi.yaml) - OpenAPI specification for the official registry API
-
-[`api_examples.md`](./api_examples.md) - Examples of what data will actually look like coming from the official registry API
-
-[`architecture.md`](./architecture.md) - Technical architecture, deployment strategies, and data flows
-
-[`server.json` README](./server-json/README.md) - description of the `server.json` purpose and schema
-
-[`new_package_registry.md`](./new_package_registry.md) - steps to add a new package registry for local server packages
+- 📄 [Public-facing docs](./modelcontextprotocol-io/) - Published on modelcontextprotocol.io
+- 🏗️ [Design documentation](./design/) - Architecture, vision, and roadmap
+- 📖 [Reference](./reference/) - Technical specifications
+- 🔧 [Contributing guides](./contributing/) - How to contribute
+- 🔒 [Administration](./administration/) - Admin operations
+- 🤝 [Community projects](./community-projects.md) - Notable registry-related work from the community

@@ -1,0 +1,1142 @@
+//nolint:testpackage
+package service
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/modelcontextprotocol/registry/internal/config"
+	"github.com/modelcontextprotocol/registry/internal/database"
+	apiv0 "github.com/modelcontextprotocol/registry/pkg/api/v0"
+	"github.com/modelcontextprotocol/registry/pkg/model"
+)
+
+func TestValidateNoDuplicateRemoteURLs(t *testing.T) {
+	ctx := context.Background()
+
+	// Create test data
+	existingServers := map[string]*apiv0.ServerJSON{
+		"existing1": {
+			Schema:      model.CurrentSchemaURL,
+			Name:        "com.example/existing-server",
+			Description: "An existing server",
+			Version:     "1.0.0",
+			Remotes: []model.Transport{
+				{Type: "streamable-http", URL: "https://api.example.com/mcp"},
+				{Type: "sse", URL: "https://webhook.example.com/sse"},
+			},
+		},
+		"existing2": {
+			Schema:      model.CurrentSchemaURL,
+			Name:        "com.microsoft/another-server",
+			Description: "Another existing server",
+			Version:     "1.0.0",
+			Remotes: []model.Transport{
+				{Type: "streamable-http", URL: "https://api.microsoft.com/mcp"},
+			},
+		},
+	}
+
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	// Create existing servers using the new CreateServer method
+	for _, server := range existingServers {
+		_, err := service.CreateServer(ctx, server)
+		require.NoError(t, err, "failed to create server: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		serverDetail apiv0.ServerJSON
+		expectError  bool
+		errorMsg     string
+	}{
+		{
+			name: "no remote URLs - should pass",
+			serverDetail: apiv0.ServerJSON{
+				Schema:      model.CurrentSchemaURL,
+				Name:        "com.example/new-server",
+				Description: "A new server with no remotes",
+				Version:     "1.0.0",
+				Remotes:     []model.Transport{},
+			},
+			expectError: false,
+		},
+		{
+			name: "new unique remote URLs - should pass",
+			serverDetail: apiv0.ServerJSON{
+				Schema:      model.CurrentSchemaURL,
+				Name:        "com.example/new-server-unique",
+				Description: "A new server",
+				Version:     "1.0.0",
+				Remotes: []model.Transport{
+					{Type: "streamable-http", URL: "https://new.example.com/mcp"},
+					{Type: "sse", URL: "https://unique.example.com/sse"},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "duplicate remote URL - should fail",
+			serverDetail: apiv0.ServerJSON{
+				Schema:      model.CurrentSchemaURL,
+				Name:        "com.example/new-server-duplicate",
+				Description: "A new server with duplicate URL",
+				Version:     "1.0.0",
+				Remotes: []model.Transport{
+					{Type: "streamable-http", URL: "https://api.example.com/mcp"}, // This URL already exists
+				},
+			},
+			expectError: true,
+			errorMsg:    "remote URL https://api.example.com/mcp is already used by server com.example/existing-server",
+		},
+		{
+			name: "updating same server with same URLs - should pass",
+			serverDetail: apiv0.ServerJSON{
+				Schema:      model.CurrentSchemaURL,
+				Name:        "com.example/existing-server", // Same name as existing
+				Description: "Updated existing server",
+				Version:     "1.1.0", // Different version
+				Remotes: []model.Transport{
+					{Type: "streamable-http", URL: "https://api.example.com/mcp"}, // Same URL as before
+				},
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			impl := service.(*registryServiceImpl)
+
+			err := impl.validateNoDuplicateRemoteURLs(ctx, nil, tt.serverDetail)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errorMsg)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestGetServerByName(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	// Create multiple versions of the same server
+	_, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/test-server",
+		Description: "Test server v1",
+		Version:     "1.0.0",
+	})
+	require.NoError(t, err)
+
+	_, err = service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/test-server",
+		Description: "Test server v2",
+		Version:     "2.0.0",
+	})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name        string
+		serverName  string
+		expectError bool
+		errorMsg    string
+		checkResult func(*testing.T, *apiv0.ServerResponse)
+	}{
+		{
+			name:        "get latest version by server name",
+			serverName:  "com.example/test-server",
+			expectError: false,
+			checkResult: func(t *testing.T, result *apiv0.ServerResponse) {
+				t.Helper()
+				assert.Equal(t, "2.0.0", result.Server.Version) // Should get latest version
+				assert.Equal(t, "Test server v2", result.Server.Description)
+				assert.True(t, result.Meta.Official.IsLatest)
+			},
+		},
+		{
+			name:        "server not found",
+			serverName:  "com.example/non-existent",
+			expectError: true,
+			errorMsg:    "record not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := service.GetServerByName(ctx, tt.serverName, false)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+				assert.Nil(t, result)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, result)
+				if tt.checkResult != nil {
+					tt.checkResult(t, result)
+				}
+			}
+		})
+	}
+}
+
+func TestGetServerByNameAndVersion(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	serverName := "com.example/versioned-server"
+
+	// Create multiple versions of the same server
+	_, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        serverName,
+		Description: "Versioned server v1",
+		Version:     "1.0.0",
+	})
+	require.NoError(t, err)
+
+	_, err = service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        serverName,
+		Description: "Versioned server v2",
+		Version:     "2.0.0",
+	})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name        string
+		serverName  string
+		version     string
+		expectError bool
+		errorMsg    string
+		checkResult func(*testing.T, *apiv0.ServerResponse)
+	}{
+		{
+			name:        "get specific version 1.0.0",
+			serverName:  serverName,
+			version:     "1.0.0",
+			expectError: false,
+			checkResult: func(t *testing.T, result *apiv0.ServerResponse) {
+				t.Helper()
+				assert.Equal(t, "1.0.0", result.Server.Version)
+				assert.Equal(t, "Versioned server v1", result.Server.Description)
+				assert.False(t, result.Meta.Official.IsLatest)
+			},
+		},
+		{
+			name:        "get specific version 2.0.0",
+			serverName:  serverName,
+			version:     "2.0.0",
+			expectError: false,
+			checkResult: func(t *testing.T, result *apiv0.ServerResponse) {
+				t.Helper()
+				assert.Equal(t, "2.0.0", result.Server.Version)
+				assert.Equal(t, "Versioned server v2", result.Server.Description)
+				assert.True(t, result.Meta.Official.IsLatest)
+			},
+		},
+		{
+			name:        "version not found",
+			serverName:  serverName,
+			version:     "3.0.0",
+			expectError: true,
+			errorMsg:    "record not found",
+		},
+		{
+			name:        "server not found",
+			serverName:  "com.example/non-existent",
+			version:     "1.0.0",
+			expectError: true,
+			errorMsg:    "record not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := service.GetServerByNameAndVersion(ctx, tt.serverName, tt.version, false)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+				assert.Nil(t, result)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, result)
+				if tt.checkResult != nil {
+					tt.checkResult(t, result)
+				}
+			}
+		})
+	}
+}
+
+func TestGetAllVersionsByServerName(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	serverName := "com.example/multi-version-server"
+
+	// Create multiple versions of the same server
+	_, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        serverName,
+		Description: "Multi-version server v1",
+		Version:     "1.0.0",
+	})
+	require.NoError(t, err)
+
+	_, err = service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        serverName,
+		Description: "Multi-version server v2",
+		Version:     "2.0.0",
+	})
+	require.NoError(t, err)
+
+	_, err = service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        serverName,
+		Description: "Multi-version server v2.1",
+		Version:     "2.1.0",
+	})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name        string
+		serverName  string
+		expectError bool
+		errorMsg    string
+		checkResult func(*testing.T, []*apiv0.ServerResponse)
+	}{
+		{
+			name:        "get all versions of server",
+			serverName:  serverName,
+			expectError: false,
+			checkResult: func(t *testing.T, result []*apiv0.ServerResponse) {
+				t.Helper()
+				assert.Len(t, result, 3)
+
+				// Collect versions
+				versions := make([]string, 0, len(result))
+				latestCount := 0
+				for _, server := range result {
+					versions = append(versions, server.Server.Version)
+					assert.Equal(t, serverName, server.Server.Name)
+					if server.Meta.Official.IsLatest {
+						latestCount++
+					}
+				}
+
+				// Verify all versions are present
+				assert.Contains(t, versions, "1.0.0")
+				assert.Contains(t, versions, "2.0.0")
+				assert.Contains(t, versions, "2.1.0")
+
+				// Only one should be marked as latest
+				assert.Equal(t, 1, latestCount)
+			},
+		},
+		{
+			name:        "server not found",
+			serverName:  "com.example/non-existent",
+			expectError: true,
+			errorMsg:    "record not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := service.GetAllVersionsByServerName(ctx, tt.serverName, false)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+				assert.Empty(t, result)
+			} else {
+				assert.NoError(t, err)
+				assert.NotEmpty(t, result)
+				if tt.checkResult != nil {
+					tt.checkResult(t, result)
+				}
+			}
+		})
+	}
+}
+
+func TestCreateServerConcurrentVersionsNoRace(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	const concurrency = 100
+	serverName := "com.example/test-concurrent"
+	results := make([]*apiv0.ServerResponse, concurrency)
+	errors := make([]error, concurrency)
+
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			result, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+				Schema:      model.CurrentSchemaURL,
+				Name:        serverName,
+				Description: fmt.Sprintf("Version %d", idx),
+				Version:     fmt.Sprintf("1.0.%d", idx),
+			})
+			results[idx] = result
+			errors[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	// All publishes should succeed
+	for i, err := range errors {
+		assert.NoError(t, err, "create server %d failed", i)
+	}
+
+	// All results should have the same server name
+	for i, result := range results {
+		if result != nil {
+			assert.Equal(t, serverName, result.Server.Name, "version %d has different server name", i)
+		}
+	}
+
+	// Query database to check the final state after all creates complete
+	allVersions, err := service.GetAllVersionsByServerName(ctx, serverName, false)
+	require.NoError(t, err, "failed to get all versions")
+
+	latestCount := 0
+	var latestVersion string
+	for _, r := range allVersions {
+		if r.Meta.Official.IsLatest {
+			latestCount++
+			latestVersion = r.Server.Version
+		}
+	}
+
+	assert.Equal(t, 1, latestCount, "should have exactly one latest version in database, found version: %s", latestVersion)
+	assert.Len(t, allVersions, concurrency, "should have all %d versions", concurrency)
+}
+
+func TestUpdateServer(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	serverName := "com.example/update-test-server"
+	version := "1.0.0"
+
+	// Create initial server
+	_, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        serverName,
+		Description: "Original description",
+		Version:     version,
+		Remotes: []model.Transport{
+			{Type: "streamable-http", URL: "https://original.example.com/mcp"},
+		},
+	})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name          string
+		serverName    string
+		version       string
+		updatedServer *apiv0.ServerJSON
+		statusChange  *StatusChangeRequest
+		expectError   bool
+		errorMsg      string
+		checkResult   func(*testing.T, *apiv0.ServerResponse)
+	}{
+		{
+			name:       "successful server update",
+			serverName: serverName,
+			version:    version,
+			updatedServer: &apiv0.ServerJSON{
+				Schema:      model.CurrentSchemaURL,
+				Name:        serverName,
+				Description: "Updated description",
+				Version:     version,
+				Remotes: []model.Transport{
+					{Type: "streamable-http", URL: "https://updated.example.com/mcp"},
+				},
+			},
+			expectError: false,
+			checkResult: func(t *testing.T, result *apiv0.ServerResponse) {
+				t.Helper()
+				assert.Equal(t, "Updated description", result.Server.Description)
+				assert.Len(t, result.Server.Remotes, 1)
+				assert.Equal(t, "https://updated.example.com/mcp", result.Server.Remotes[0].URL)
+				assert.NotZero(t, result.Meta.Official.UpdatedAt)
+			},
+		},
+		{
+			name:       "update with status change",
+			serverName: serverName,
+			version:    version,
+			updatedServer: &apiv0.ServerJSON{
+				Schema:      model.CurrentSchemaURL,
+				Name:        serverName,
+				Description: "Updated with status change",
+				Version:     version,
+			},
+			statusChange: &StatusChangeRequest{
+				NewStatus: model.StatusDeprecated,
+			},
+			expectError: false,
+			checkResult: func(t *testing.T, result *apiv0.ServerResponse) {
+				t.Helper()
+				assert.Equal(t, "Updated with status change", result.Server.Description)
+				assert.Equal(t, model.StatusDeprecated, result.Meta.Official.Status)
+			},
+		},
+		{
+			name:       "update non-existent server",
+			serverName: "com.example/non-existent",
+			version:    "1.0.0",
+			updatedServer: &apiv0.ServerJSON{
+				Schema:      model.CurrentSchemaURL,
+				Name:        "com.example/non-existent",
+				Description: "Should fail",
+				Version:     "1.0.0",
+			},
+			expectError: true,
+			errorMsg:    "record not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := service.UpdateServer(ctx, tt.serverName, tt.version, tt.updatedServer, tt.statusChange)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+				assert.Nil(t, result)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, result)
+				if tt.checkResult != nil {
+					tt.checkResult(t, result)
+				}
+			}
+		})
+	}
+}
+
+func TestUpdateServer_SkipValidationForDeletedServers(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	// Enable registry validation to test that it gets skipped for deleted servers
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: true})
+
+	serverName := "com.example/validation-skip-test"
+	version := "1.0.0"
+
+	// Create server with invalid package configuration (this would fail registry validation)
+	invalidServer := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        serverName,
+		Description: "Server with invalid package for testing validation skip",
+		Version:     version,
+		Packages: []model.Package{
+			{
+				RegistryType: "npm",
+				Identifier:   "non-existent-package-for-validation-test",
+				Version:      "1.0.0",
+				Transport:    model.Transport{Type: "stdio"},
+			},
+		},
+	}
+
+	// Create initial server (validation disabled for creation in this test)
+	originalConfig := service.(*registryServiceImpl).cfg.EnableRegistryValidation
+	service.(*registryServiceImpl).cfg.EnableRegistryValidation = false
+	_, err := service.CreateServer(ctx, invalidServer)
+	require.NoError(t, err, "failed to create server with validation disabled")
+	service.(*registryServiceImpl).cfg.EnableRegistryValidation = originalConfig
+
+	// First, set server to deleted status
+	deletedStatusChange := &StatusChangeRequest{
+		NewStatus: model.StatusDeleted,
+	}
+	_, err = service.UpdateServer(ctx, serverName, version, invalidServer, deletedStatusChange)
+	require.NoError(t, err, "should be able to set server to deleted (validation should be skipped)")
+
+	// Verify server is now deleted (need includeDeleted=true to find it)
+	updatedServer, err := service.GetServerByNameAndVersion(ctx, serverName, version, true)
+	require.NoError(t, err)
+	assert.Equal(t, model.StatusDeleted, updatedServer.Meta.Official.Status)
+
+	// Now try to update a deleted server - validation should be skipped
+	updatedInvalidServer := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        serverName,
+		Description: "Updated description for deleted server",
+		Version:     version,
+		Packages: []model.Package{
+			{
+				RegistryType: "npm",
+				Identifier:   "another-non-existent-package-for-validation-test",
+				Version:      "2.0.0",
+				Transport:    model.Transport{Type: "stdio"},
+			},
+		},
+	}
+
+	// This should succeed despite invalid packages because server is deleted
+	result, err := service.UpdateServer(ctx, serverName, version, updatedInvalidServer, nil)
+	assert.NoError(t, err, "updating deleted server should skip registry validation")
+	assert.NotNil(t, result)
+	assert.Equal(t, "Updated description for deleted server", result.Server.Description)
+	assert.Equal(t, model.StatusDeleted, result.Meta.Official.Status)
+
+	// Test updating a server being set to deleted status
+	activeServer := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/being-deleted-test",
+		Description: "Server being deleted",
+		Version:     "1.0.0",
+		Packages: []model.Package{
+			{
+				RegistryType: "npm",
+				Identifier:   "yet-another-non-existent-package",
+				Version:      "1.0.0",
+				Transport:    model.Transport{Type: "stdio"},
+			},
+		},
+	}
+
+	// Create active server (with validation disabled)
+	service.(*registryServiceImpl).cfg.EnableRegistryValidation = false
+	_, err = service.CreateServer(ctx, activeServer)
+	require.NoError(t, err)
+	service.(*registryServiceImpl).cfg.EnableRegistryValidation = originalConfig
+
+	// Update server and set to deleted in same operation - should skip validation
+	newDeletedStatusChange := &StatusChangeRequest{
+		NewStatus: model.StatusDeleted,
+	}
+	result2, err := service.UpdateServer(ctx, "com.example/being-deleted-test", "1.0.0", activeServer, newDeletedStatusChange)
+	assert.NoError(t, err, "updating server being set to deleted should skip registry validation")
+	assert.NotNil(t, result2)
+	assert.Equal(t, model.StatusDeleted, result2.Meta.Official.Status)
+}
+
+func TestListServers(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	// Create test servers
+	testServers := []struct {
+		name        string
+		version     string
+		description string
+	}{
+		{"com.example/server-alpha", "1.0.0", "Alpha server"},
+		{"com.example/server-beta", "1.0.0", "Beta server"},
+		{"com.example/server-gamma", "2.0.0", "Gamma server"},
+	}
+
+	for _, server := range testServers {
+		_, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+			Schema:      model.CurrentSchemaURL,
+			Name:        server.name,
+			Description: server.description,
+			Version:     server.version,
+		})
+		require.NoError(t, err)
+	}
+
+	tests := []struct {
+		name          string
+		filter        *database.ServerFilter
+		cursor        string
+		limit         int
+		expectedCount int
+		expectError   bool
+	}{
+		{
+			name:          "list all servers",
+			filter:        nil,
+			limit:         10,
+			expectedCount: 3,
+		},
+		{
+			name: "filter by name",
+			filter: &database.ServerFilter{
+				Name: stringPtr("com.example/server-alpha"),
+			},
+			limit:         10,
+			expectedCount: 1,
+		},
+		{
+			name: "filter by version",
+			filter: &database.ServerFilter{
+				Version: stringPtr("1.0.0"),
+			},
+			limit:         10,
+			expectedCount: 2,
+		},
+		{
+			name:          "pagination with limit",
+			filter:        nil,
+			limit:         2,
+			expectedCount: 2,
+		},
+		{
+			name:   "cursor pagination",
+			filter: nil,
+			cursor: "com.example/server-alpha",
+			limit:  10,
+			// Should return servers after 'server-alpha' alphabetically
+			expectedCount: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			results, nextCursor, err := service.ListServers(ctx, tt.filter, tt.cursor, tt.limit)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Len(t, results, tt.expectedCount)
+
+			// Test cursor behavior
+			if tt.limit < len(testServers) && len(results) == tt.limit {
+				assert.NotEmpty(t, nextCursor, "Should return next cursor when results are limited")
+			}
+		})
+	}
+}
+
+func TestVersionComparison(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	serverName := "com.example/version-comparison-server"
+
+	// Create versions in non-chronological order to test version comparison logic
+	versions := []struct {
+		version     string
+		description string
+		delay       time.Duration // Delay to simulate different publish times
+	}{
+		{"2.0.0", "Version 2.0.0", 0},
+		{"1.0.0", "Version 1.0.0", 10 * time.Millisecond},
+		{"2.1.0", "Version 2.1.0", 20 * time.Millisecond},
+		{"1.5.0", "Version 1.5.0", 30 * time.Millisecond},
+	}
+
+	for _, v := range versions {
+		if v.delay > 0 {
+			time.Sleep(v.delay)
+		}
+		_, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+			Schema:      model.CurrentSchemaURL,
+			Name:        serverName,
+			Description: v.description,
+			Version:     v.version,
+		})
+		require.NoError(t, err, "Failed to create version %s", v.version)
+	}
+
+	// Get the latest version - should be 2.1.0 based on semantic versioning
+	latest, err := service.GetServerByName(ctx, serverName, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, "2.1.0", latest.Server.Version, "Latest version should be 2.1.0")
+	assert.True(t, latest.Meta.Official.IsLatest)
+
+	// Verify only one version is marked as latest
+	allVersions, err := service.GetAllVersionsByServerName(ctx, serverName, false)
+	require.NoError(t, err)
+
+	latestCount := 0
+	for _, version := range allVersions {
+		if version.Meta.Official.IsLatest {
+			latestCount++
+		}
+	}
+	assert.Equal(t, 1, latestCount, "Exactly one version should be marked as latest")
+}
+
+func TestUpdateServerStatus_ValidateRemoteURLsOnRestoreToActive(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	remoteURL := "https://api.example.com/mcp"
+
+	// Create Server A with a remote URL
+	serverA := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/server-a",
+		Description: "Server A with remote URL",
+		Version:     "1.0.0",
+		Remotes: []model.Transport{
+			{Type: "streamable-http", URL: remoteURL},
+		},
+	}
+	_, err := service.CreateServer(ctx, serverA)
+	require.NoError(t, err)
+
+	// Delete Server A
+	_, err = service.UpdateServerStatus(ctx, "com.example/server-a", "1.0.0", &StatusChangeRequest{
+		NewStatus: model.StatusDeleted,
+	})
+	require.NoError(t, err)
+
+	// Create Server B with the same remote URL (should succeed since A is deleted)
+	serverB := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/server-b",
+		Description: "Server B with same remote URL",
+		Version:     "1.0.0",
+		Remotes: []model.Transport{
+			{Type: "streamable-http", URL: remoteURL},
+		},
+	}
+	_, err = service.CreateServer(ctx, serverB)
+	require.NoError(t, err)
+
+	// Try to restore Server A to active - should fail due to URL conflict
+	_, err = service.UpdateServerStatus(ctx, "com.example/server-a", "1.0.0", &StatusChangeRequest{
+		NewStatus: model.StatusActive,
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "remote URL")
+	assert.Contains(t, err.Error(), "already used by server")
+}
+
+func TestUpdateServerStatus_ValidateRemoteURLsOnRestoreFromDeleted(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	remoteURL := "https://api.deleted.com/mcp"
+
+	// Create Server A with a remote URL and delete it
+	serverA := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/deleted-server",
+		Description: "Server to be deleted",
+		Version:     "1.0.0",
+		Remotes: []model.Transport{
+			{Type: "streamable-http", URL: remoteURL},
+		},
+	}
+	_, err := service.CreateServer(ctx, serverA)
+	require.NoError(t, err)
+
+	// Delete Server A
+	_, err = service.UpdateServerStatus(ctx, "com.example/deleted-server", "1.0.0", &StatusChangeRequest{
+		NewStatus: model.StatusDeleted,
+	})
+	require.NoError(t, err)
+
+	// Create Server B with the same remote URL (should succeed since A is deleted)
+	serverB := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/new-server",
+		Description: "New server with same remote URL",
+		Version:     "1.0.0",
+		Remotes: []model.Transport{
+			{Type: "streamable-http", URL: remoteURL},
+		},
+	}
+	_, err = service.CreateServer(ctx, serverB)
+	require.NoError(t, err)
+
+	// Try to restore deleted server to active - should fail due to URL conflict
+	_, err = service.UpdateServerStatus(ctx, "com.example/deleted-server", "1.0.0", &StatusChangeRequest{
+		NewStatus: model.StatusActive,
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "remote URL")
+	assert.Contains(t, err.Error(), "already used by server")
+}
+
+func TestUpdateAllVersionsStatus_ValidateRemoteURLsOnRestoreToActive(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	remoteURL := "https://api.allversions.com/mcp"
+
+	// Create Server A with multiple versions
+	serverAv1 := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/multi-version-server",
+		Description: "Server A version 1",
+		Version:     "1.0.0",
+		Remotes: []model.Transport{
+			{Type: "streamable-http", URL: remoteURL},
+		},
+	}
+	_, err := service.CreateServer(ctx, serverAv1)
+	require.NoError(t, err)
+
+	serverAv2 := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/multi-version-server",
+		Description: "Server A version 2",
+		Version:     "2.0.0",
+		Remotes: []model.Transport{
+			{Type: "streamable-http", URL: remoteURL},
+		},
+	}
+	_, err = service.CreateServer(ctx, serverAv2)
+	require.NoError(t, err)
+
+	// Delete all versions of Server A
+	_, err = service.UpdateAllVersionsStatus(ctx, "com.example/multi-version-server", &StatusChangeRequest{
+		NewStatus: model.StatusDeleted,
+	})
+	require.NoError(t, err)
+
+	// Create Server B with the same remote URL
+	serverB := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/conflicting-server",
+		Description: "Server B with same remote URL",
+		Version:     "1.0.0",
+		Remotes: []model.Transport{
+			{Type: "streamable-http", URL: remoteURL},
+		},
+	}
+	_, err = service.CreateServer(ctx, serverB)
+	require.NoError(t, err)
+
+	// Try to restore all versions of Server A to active - should fail
+	_, err = service.UpdateAllVersionsStatus(ctx, "com.example/multi-version-server", &StatusChangeRequest{
+		NewStatus: model.StatusActive,
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "remote URL")
+	assert.Contains(t, err.Error(), "already used by server")
+}
+
+func TestUpdateServerStatus_NoConflictWhenRestoringWithUniqueURLs(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	// Create and delete a server
+	server := &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/unique-url-server",
+		Description: "Server with unique URL",
+		Version:     "1.0.0",
+		Remotes: []model.Transport{
+			{Type: "streamable-http", URL: "https://unique.example.com/mcp"},
+		},
+	}
+	_, err := service.CreateServer(ctx, server)
+	require.NoError(t, err)
+
+	// Delete the server
+	_, err = service.UpdateServerStatus(ctx, "com.example/unique-url-server", "1.0.0", &StatusChangeRequest{
+		NewStatus: model.StatusDeleted,
+	})
+	require.NoError(t, err)
+
+	// Restore to active - should succeed since URL is still unique
+	result, err := service.UpdateServerStatus(ctx, "com.example/unique-url-server", "1.0.0", &StatusChangeRequest{
+		NewStatus: model.StatusActive,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Equal(t, model.StatusActive, result.Meta.Official.Status)
+}
+
+func TestRecalculateLatest_PromotesNextHighestWhenLatestSoftDeleted(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	serverName := "com.example/delete-latest-server"
+
+	// Publish 1.0.0, then 0.0.59. 1.0.0 is latest.
+	_, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema: model.CurrentSchemaURL, Name: serverName, Description: "v1", Version: "1.0.0",
+	})
+	require.NoError(t, err)
+	_, err = service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema: model.CurrentSchemaURL, Name: serverName, Description: "v0.0.59", Version: "0.0.59",
+	})
+	require.NoError(t, err)
+
+	// Soft-delete 1.0.0.
+	_, err = service.UpdateServerStatus(ctx, serverName, "1.0.0", &StatusChangeRequest{
+		NewStatus: model.StatusDeleted,
+	})
+	require.NoError(t, err)
+
+	// 0.0.59 should now be latest.
+	latest, err := service.GetServerByName(ctx, serverName, false)
+	require.NoError(t, err)
+	assert.Equal(t, "0.0.59", latest.Server.Version)
+	assert.True(t, latest.Meta.Official.IsLatest)
+}
+
+func TestRecalculateLatest_ReproFromIssue1081(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	serverName := "com.example/issue-1081-repro"
+
+	// 1. Publish 1.0.0.
+	_, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema: model.CurrentSchemaURL, Name: serverName, Description: "v1", Version: "1.0.0",
+	})
+	require.NoError(t, err)
+
+	// 2. Publish 0.0.59 — expected not latest at this point.
+	_, err = service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema: model.CurrentSchemaURL, Name: serverName, Description: "v0.0.59", Version: "0.0.59",
+	})
+	require.NoError(t, err)
+
+	// 3. Delete 1.0.0.
+	_, err = service.UpdateServerStatus(ctx, serverName, "1.0.0", &StatusChangeRequest{
+		NewStatus: model.StatusDeleted,
+	})
+	require.NoError(t, err)
+
+	// 4. /versions/latest must not 404.
+	latest, err := service.GetServerByName(ctx, serverName, false)
+	require.NoError(t, err)
+	assert.Equal(t, "0.0.59", latest.Server.Version)
+
+	// 5. Publish 0.0.60 — should become latest because compare now excludes deleted 1.0.0.
+	_, err = service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema: model.CurrentSchemaURL, Name: serverName, Description: "v0.0.60", Version: "0.0.60",
+	})
+	require.NoError(t, err)
+
+	latest, err = service.GetServerByName(ctx, serverName, false)
+	require.NoError(t, err)
+	assert.Equal(t, "0.0.60", latest.Server.Version)
+	assert.True(t, latest.Meta.Official.IsLatest)
+
+	// Only one row should be flagged latest.
+	all, err := service.GetAllVersionsByServerName(ctx, serverName, true)
+	require.NoError(t, err)
+	latestCount := 0
+	for _, v := range all {
+		if v.Meta.Official.IsLatest {
+			latestCount++
+		}
+	}
+	assert.Equal(t, 1, latestCount)
+}
+
+func TestRecalculateLatest_AllDeletedKeepsHighestAsLatest(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	serverName := "com.example/all-deleted-server"
+
+	_, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema: model.CurrentSchemaURL, Name: serverName, Description: "v1", Version: "1.0.0",
+	})
+	require.NoError(t, err)
+	_, err = service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema: model.CurrentSchemaURL, Name: serverName, Description: "v2", Version: "2.0.0",
+	})
+	require.NoError(t, err)
+
+	// Delete all versions in one call.
+	_, err = service.UpdateAllVersionsStatus(ctx, serverName, &StatusChangeRequest{
+		NewStatus: model.StatusDeleted,
+	})
+	require.NoError(t, err)
+
+	// Public lookup (includeDeleted=false) must now 404.
+	_, err = service.GetServerByName(ctx, serverName, false)
+	require.ErrorIs(t, err, database.ErrNotFound)
+
+	// Admin lookup (includeDeleted=true) must still find the server: the highest deleted
+	// version keeps is_latest=true so the server remains addressable for restore flows.
+	latest, err := service.GetServerByName(ctx, serverName, true)
+	require.NoError(t, err)
+	assert.Equal(t, "2.0.0", latest.Server.Version)
+	assert.True(t, latest.Meta.Official.IsLatest)
+}
+
+func TestRecalculateLatest_RestoringHigherVersionPromotesIt(t *testing.T) {
+	ctx := context.Background()
+	testDB := database.NewTestDB(t)
+	service := NewRegistryService(testDB, &config.Config{EnableRegistryValidation: false})
+
+	serverName := "com.example/restore-server"
+
+	// Publish 2.0.0 and 1.0.0 — 2.0.0 is latest.
+	_, err := service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema: model.CurrentSchemaURL, Name: serverName, Description: "v2", Version: "2.0.0",
+	})
+	require.NoError(t, err)
+	_, err = service.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema: model.CurrentSchemaURL, Name: serverName, Description: "v1", Version: "1.0.0",
+	})
+	require.NoError(t, err)
+
+	// Delete 2.0.0 — 1.0.0 gets promoted.
+	_, err = service.UpdateServerStatus(ctx, serverName, "2.0.0", &StatusChangeRequest{
+		NewStatus: model.StatusDeleted,
+	})
+	require.NoError(t, err)
+	latest, err := service.GetServerByName(ctx, serverName, false)
+	require.NoError(t, err)
+	require.Equal(t, "1.0.0", latest.Server.Version)
+
+	// Restore 2.0.0 — it should reclaim latest.
+	_, err = service.UpdateServerStatus(ctx, serverName, "2.0.0", &StatusChangeRequest{
+		NewStatus: model.StatusActive,
+	})
+	require.NoError(t, err)
+	latest, err = service.GetServerByName(ctx, serverName, false)
+	require.NoError(t, err)
+	assert.Equal(t, "2.0.0", latest.Server.Version)
+	assert.True(t, latest.Meta.Official.IsLatest)
+}
+
+// Helper functions
+func stringPtr(s string) *string {
+	return &s
+}

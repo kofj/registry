@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write # needed for signing
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0.24.2
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94
+        with:
+          distribution: goreleaser
+          version: v2.12.0
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  ko-push:
+    name: Build and Push Image with ko
+    runs-on: ubuntu-latest
+    needs: goreleaser
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Set up ko
+        uses: ko-build/setup-ko@v0.10
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get build timestamp and version
+        id: build-info
+        run: |
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+          # Extract version from tag and strip 'v' prefix (e.g., refs/tags/v1.2.3 -> 1.2.3)
+          VERSION="${GITHUB_REF#refs/tags/}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build and push with ko
+        env:
+          KO_DOCKER_REPO: ghcr.io/${{ github.repository }}
+          VERSION: ${{ steps.build-info.outputs.version }}
+          GIT_COMMIT: ${{ github.sha }}
+          BUILD_TIME: ${{ steps.build-info.outputs.timestamp }}
+        run: |
+          # Build and push multi-platform image with version tag and latest
+          ko build ./cmd/registry \
+            --bare \
+            --platform=linux/amd64,linux/arm64 \
+            --tags=${{ steps.build-info.outputs.version }},latest
